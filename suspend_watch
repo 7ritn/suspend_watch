@@ -1,0 +1,233 @@
+#!/bin/python -u
+
+import subprocess
+import os
+import time
+import fcntl
+import argparse
+import errno
+from stat import *
+from dataclasses import dataclass
+
+import yaml
+import psutil
+from pytimeparse import parse
+
+@dataclass
+class Globals:
+    dryrun: bool
+    check: bool
+    verbosity: int
+    timeout: int
+    frequency: int
+    suspend_command: str
+    conntrack_path: str
+
+@dataclass
+class NetworkCheck:
+    name: str
+    minimum: int
+    conn_filter: list
+
+def unlock_locks(locks):
+    try:
+        for lock in locks:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            os.close(lock)
+    except OSError:
+        pass
+
+class Config:
+    glob: Globals = None
+    network = list()
+    locks = list()
+    processes = list()
+
+    def _check_config_safety(self, config_path, globals_yaml):
+        config_perm = os.stat(config_path)
+        config_world_writeable = config_perm.st_uid != 0 or config_perm.st_gid != 0 or S_IMODE(config_perm.st_mode) & S_IWOTH
+        config_contains_unsafe_settings = "suspend_command" in globals_yaml or "conntrack_path" in globals_yaml
+        if config_world_writeable and config_contains_unsafe_settings:
+            raise IOError("Config file can be edited by non-root users allowing arbitrary code execution. Please change!")
+
+    def _parse_globals(self, config_yaml, args):
+        globals_yaml: dict = config_yaml.get("global", dict())
+
+        if not args.unsafe:
+            self._check_config_safety(args.config, globals_yaml)
+
+        self.glob = Globals(
+            args.dryrun if args.dryrun else globals_yaml.get("dryrun", False),
+            args.check if args.check else globals_yaml.get("check", False),
+            args.verbosity if args.verbosity else globals_yaml.get("verbosity", 0),
+            parse(args.timeout if args.timeout else globals_yaml.get("timeout", "10 min")),
+            parse(args.frequency if args.frequency else globals_yaml.get("frequency", "1 min")),
+            args.suspend_command if args.suspend_command else globals_yaml.get("suspend_command", "/usr/bin/systemctl suspend"),
+            args.conntrack_path if args.conntrack_path else globals_yaml.get("conntrack_path", "/usr/bin/conntrack"))
+
+    def _parse_network(self, config_yaml):
+        network_yaml: dict = config_yaml["checks"]["network"]
+        defaults_network: dict = network_yaml["defaults"]
+        for check in network_yaml["entries"]:
+            conn_filter = list()
+            entries = check.get("conntrack", list())
+
+            for (param, value) in entries.items():
+                if value is None:
+                    if defaults_network.get(param, None) is not None:
+                        value = defaults_network.get(param)
+                    else:
+                        raise ValueError(str(param) + " has no value and no default is defined")
+                conn_filter += ["--" + param, str(value)]
+
+            name = check.get("name", "Unnamed")
+            minimum = check.get("min", 1)
+
+            self.network.append(NetworkCheck(name, minimum, conn_filter))
+
+    def __init__(self, args):
+        config_file = open(args.config, 'r', encoding="utf-8")
+        config_yaml = yaml.safe_load(config_file)
+
+        # Globals
+        self._parse_globals(config_yaml, args)
+
+        # Network
+        self._parse_network(config_yaml)
+
+        # Locks
+        self.locks = config_yaml["checks"]["locks"]
+
+        # Processes
+        self.processes = [ proc.lower() for proc in config_yaml["checks"]["processes"]]
+
+
+class SuspendCheck:
+
+    active_locks = list()
+
+    def __init__(self, config_path):
+        self.conf = Config(config_path)
+
+    def _check_network(self):
+        count = 0
+        for check in self.conf.network:
+            proc = subprocess.run([self.conf.glob.conntrack_path, "-L"] + check.conn_filter, shell=False, check=False, capture_output=True, text=True)
+            current_count = proc.stdout.count('\n')
+            del proc
+            if current_count >= check.minimum:
+                if self.conf.glob.verbosity >= 2:
+                    print(check.name + " active")
+                    count += 1
+                else:
+                    break
+
+        return count >= 1
+
+    def _check_locks(self):
+        OPEN_MODE = os.O_RDWR | os.O_CREAT | os.O_TRUNC
+        count = 0
+
+        for lock_path in self.conf.locks:
+            if os.path.isfile(lock_path):
+                try:
+                    lock = os.open(lock_path, OPEN_MODE)
+                except IOError:
+                    continue
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.active_locks.append(lock)
+                except OSError as exception:
+                    os.close(lock)
+                    if exception.errno is errno.EACCES or exception.errno is errno.EAGAIN:
+                        if self.conf.glob.verbosity >= 2:
+                            print(lock_path + " active")
+                            count += 1
+                        else:
+                            return True
+                
+        return count >= 1
+
+    def _check_processes(self):
+        count = 0
+        for proc in psutil.process_iter():
+            try:
+                if proc.name().lower() in self.conf.processes:
+                    if self.conf.glob.verbosity >= 2:
+                        print(proc.name() + " active")
+                        count += 1
+                    else:
+                        return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+
+        return count >= 1
+
+    # Returns True if anything is active
+    def check(self):
+        ret = False
+
+        if self.conf.glob.verbosity >= 2:
+            ret |= self._check_network()
+            ret |= self._check_locks()
+            ret |= self._check_processes()
+        else:
+            ret = self._check_network() or self._check_locks() or self._check_processes()
+
+        if ret is True:
+            unlock_locks(self.active_locks)
+
+        return ret
+
+parser = argparse.ArgumentParser(
+    prog='Suspend Watch',
+    description='Monitor network traffic and log files to suspend when idle')
+
+parser.add_argument("-n", "--dryrun", help="dont actually suspend (default False)",
+                    action="store_true")
+parser.add_argument("--unsafe", help="dont check if config is world-writeable (default False)",
+                    action="store_true", default=False)
+parser.add_argument("-c", "--check", help="only perform one check (default False)",
+                    action="store_true")
+parser.add_argument("-v", "--verbosity", help="increase output verbosity (default 0)",
+                    type=int)
+parser.add_argument("-t", "--timeout", help="amount of no activity checks in a row until suspend (default 10 min)",
+                    type=int)
+parser.add_argument("-f", "--frequency", help="frequency of checks in seconds (default 1 min)",
+                    type=int)
+parser.add_argument("--suspend_command", help="executeable to be run when no activity detected (default /usr/bin/systemctl suspend)",
+                    type=str)
+parser.add_argument("--conntrack_path", help="path to conntrack executeable (default /usr/bin/conntrack)",
+                    type=str)
+parser.add_argument("config", help="config file containing checks",
+                    type=str)
+cli_args = parser.parse_args()
+
+if os.geteuid() != 0:
+    exit("Root privileges required for script")
+
+checker = SuspendCheck(cli_args)
+
+if checker.conf.glob.check:
+    print("Activity detected" if checker.check() else "No acitivity detected")
+else:
+    no_activity_duration = 0
+    while True:
+        time.sleep(checker.conf.glob.frequency)
+
+        if checker.check() is False:
+            if checker.conf.glob.verbosity >= 2:
+                print("No activity detected")
+            no_activity_duration += checker.conf.glob.frequency
+        else:
+            no_activity_duration = 0
+
+        if no_activity_duration > checker.conf.glob.timeout:
+            if checker.conf.glob.verbosity >= 1:
+                print("Suspending")
+            if not checker.conf.glob.dryrun:
+                subprocess.run(checker.conf.glob.suspend_command.split(' '), shell=False, check=False)
+                unlock_locks(checker.active_locks)
+            else:
+                print("Dryrun active => suspend command is not executed")
+            no_activity_duration = 0
