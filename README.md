@@ -29,6 +29,8 @@ optional arguments:
   -n, --dryrun          don't actually suspend (default False)
   --unsafe              don't check if config is world-writeable (default False)
   -c, --check           only perform one check (default False)
+  -s, --ignore_stale    ignore stale connections (default False)
+  --fast_resuspend      after being woken up, resuspend if no activity is detected at an initial check after 15s (default False)
   -v VERBOSITY, --verbosity VERBOSITY
                         increase output verbosity (default 0)
   -t TIMEOUT, --timeout TIMEOUT
