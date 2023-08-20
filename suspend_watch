@@ -19,6 +19,7 @@ class Globals:
     dryrun: bool
     check: bool
     ignore_stale: bool
+    fast_resuspend: bool
     verbosity: int
     timeout: int
     frequency: int
@@ -67,6 +68,7 @@ class Config:
             args.dryrun if args.dryrun else globals_yaml.get("dryrun", False),
             args.check if args.check else globals_yaml.get("check", False),
             args.ignore_stale if args.ignore_stale else globals_yaml.get("ignore_stale", False),
+            args.fast_resuspend if args.fast_resuspend else globals_yaml.get("fast_resuspend", False),
             args.verbosity if args.verbosity else globals_yaml.get("verbosity", 0),
             pytimeparse.parse(args.timeout if args.timeout else globals_yaml.get("timeout", "10 min")),
             pytimeparse.parse(args.frequency if args.frequency else globals_yaml.get("frequency", "1 min")),
@@ -232,6 +234,8 @@ parser.add_argument("-c", "--check", help="only perform one check (default False
                     action="store_true")
 parser.add_argument("-s", "--ignore_stale", help="ignore stale connections (default False)",
                     action="store_true")
+parser.add_argument("--fast_resuspend", help="after being woken up, resuspend if no activity is detected at an initial check after 15s (default False)",
+                    action="store_true")
 parser.add_argument("-v", "--verbosity", help="increase output verbosity (default 0)",
                     type=int)
 parser.add_argument("-t", "--timeout", help="amount of no activity checks in a row until suspend (default 10 min)",
@@ -255,6 +259,7 @@ if checker.conf.glob.check:
     print("Activity detected" if checker.check() else "No acitivity detected")
 else:
     no_activity_duration = 0
+    just_resumed = False
     while True:
         time.sleep(checker.conf.glob.frequency)
 
@@ -265,7 +270,7 @@ else:
         else:
             no_activity_duration = 0
 
-        if no_activity_duration > checker.conf.glob.timeout:
+        if no_activity_duration > checker.conf.glob.timeout or (checker.conf.glob.fast_resuspend and just_resumed and no_activity_duration > 0):
             if checker.conf.glob.verbosity >= 1:
                 print("Suspending")
             if not checker.conf.glob.dryrun:
@@ -275,6 +280,9 @@ else:
                     # Run once to initalize stale connection list, so when the first check runs stale connections can already classified as such
                     time.sleep(5)
                     checker.check()
+                just_resumed = True
             else:
                 print("Dryrun active => suspend command is not executed")
             no_activity_duration = 0
+        else:
+            just_resumed = False
