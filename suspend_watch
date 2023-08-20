@@ -6,22 +6,29 @@ import time
 import fcntl
 import argparse
 import errno
-from stat import *
+import stat
+from sys import stderr
 from dataclasses import dataclass
 
 import yaml
 import psutil
-from pytimeparse import parse
+import pytimeparse
 
 @dataclass
 class Globals:
     dryrun: bool
     check: bool
+    ignore_stale: bool
     verbosity: int
     timeout: int
     frequency: int
     suspend_command: str
     conntrack_path: str
+
+@dataclass
+class Connection:
+    conn_id: int
+    packets: int
 
 @dataclass
 class NetworkCheck:
@@ -45,7 +52,7 @@ class Config:
 
     def _check_config_safety(self, config_path, globals_yaml):
         config_perm = os.stat(config_path)
-        config_world_writeable = config_perm.st_uid != 0 or config_perm.st_gid != 0 or S_IMODE(config_perm.st_mode) & S_IWOTH
+        config_world_writeable = config_perm.st_uid != 0 or config_perm.st_gid != 0 or stat.S_IMODE(config_perm.st_mode) & stat.S_IWOTH
         config_contains_unsafe_settings = "suspend_command" in globals_yaml or "conntrack_path" in globals_yaml
         if config_world_writeable and config_contains_unsafe_settings:
             raise IOError("Config file can be edited by non-root users allowing arbitrary code execution. Please change!")
@@ -59,16 +66,17 @@ class Config:
         self.glob = Globals(
             args.dryrun if args.dryrun else globals_yaml.get("dryrun", False),
             args.check if args.check else globals_yaml.get("check", False),
+            args.ignore_stale if args.ignore_stale else globals_yaml.get("ignore_stale", False),
             args.verbosity if args.verbosity else globals_yaml.get("verbosity", 0),
-            parse(args.timeout if args.timeout else globals_yaml.get("timeout", "10 min")),
-            parse(args.frequency if args.frequency else globals_yaml.get("frequency", "1 min")),
+            pytimeparse.parse(args.timeout if args.timeout else globals_yaml.get("timeout", "10 min")),
+            pytimeparse.parse(args.frequency if args.frequency else globals_yaml.get("frequency", "1 min")),
             args.suspend_command if args.suspend_command else globals_yaml.get("suspend_command", "/usr/bin/systemctl suspend"),
             args.conntrack_path if args.conntrack_path else globals_yaml.get("conntrack_path", "/usr/bin/conntrack"))
 
     def _parse_network(self, config_yaml):
-        network_yaml: dict = config_yaml["checks"]["network"]
-        defaults_network: dict = network_yaml["defaults"]
-        for check in network_yaml["entries"]:
+        network_yaml: dict = config_yaml.get("checks", dict()).get("network", dict())
+        defaults_network: dict = network_yaml.get("defaults", dict())
+        for check in network_yaml.get("entries", dict()):
             conn_filter = list()
             entries = check.get("conntrack", list())
 
@@ -96,28 +104,61 @@ class Config:
         self._parse_network(config_yaml)
 
         # Locks
-        self.locks = config_yaml["checks"]["locks"]
+        self.locks = config_yaml.get("checks", dict()).get("locks", list())
 
         # Processes
-        self.processes = [ proc.lower() for proc in config_yaml["checks"]["processes"]]
+        self.processes = [ proc.lower() for proc in config_yaml.get("checks", dict()).get("processes", list())]
 
 
 class SuspendCheck:
 
     active_locks = list()
+    connections = dict()
 
     def __init__(self, config_path):
         self.conf = Config(config_path)
 
+    def _check_staleness(self, output: str):
+        active_connections = 0
+        for line in output.split('\n'):
+            if len(line.strip()) == 0:
+                continue
+            conn_id = -1
+            packets = -1
+            for prop in line.split(' '):
+                pair_split = prop.split('=')
+                if len(pair_split) == 2:
+                    if pair_split[0] == "packets":
+                        packets += int(pair_split[1])
+                    elif pair_split[0] == "id":
+                        conn_id = int(pair_split[1])
+
+            if conn_id == -1 or packets == -1:
+                print("Could not check for staleness! Is nf_conntrack_acct activated?", file=stderr)
+                continue
+
+            if conn_id not in self.connections:
+                active_connections += 1
+                self.connections[conn_id] = Connection(conn_id, packets)
+            elif self.connections[conn_id].packets != packets:
+                active_connections += 1
+                self.connections[conn_id].packets = packets
+
+        return active_connections
+
+
+
     def _check_network(self):
         count = 0
         for check in self.conf.network:
-            proc = subprocess.run([self.conf.glob.conntrack_path, "-L"] + check.conn_filter, shell=False, check=False, capture_output=True, text=True)
+            proc = subprocess.run([self.conf.glob.conntrack_path, "-L", "-o", "id"] + check.conn_filter, shell=False, check=False, capture_output=True, text=True)
             current_count = proc.stdout.count('\n')
-            del proc
-            if current_count >= check.minimum:
+            conn_count = current_count if not self.conf.glob.ignore_stale else self._check_staleness(proc.stdout)
+            if conn_count >= check.minimum:
                 if self.conf.glob.verbosity >= 2:
                     print(check.name + " active")
+                    if self.conf.glob.verbosity >= 3:
+                        print(proc.stdout)
                     count += 1
                 else:
                     break
@@ -145,7 +186,7 @@ class SuspendCheck:
                             count += 1
                         else:
                             return True
-                
+
         return count >= 1
 
     def _check_processes(self):
@@ -189,6 +230,8 @@ parser.add_argument("--unsafe", help="dont check if config is world-writeable (d
                     action="store_true", default=False)
 parser.add_argument("-c", "--check", help="only perform one check (default False)",
                     action="store_true")
+parser.add_argument("-s", "--ignore_stale", help="ignore stale connections (default False)",
+                    action="store_true")
 parser.add_argument("-v", "--verbosity", help="increase output verbosity (default 0)",
                     type=int)
 parser.add_argument("-t", "--timeout", help="amount of no activity checks in a row until suspend (default 10 min)",
@@ -228,6 +271,10 @@ else:
             if not checker.conf.glob.dryrun:
                 subprocess.run(checker.conf.glob.suspend_command.split(' '), shell=False, check=False)
                 unlock_locks(checker.active_locks)
+                if checker.conf.glob.ignore_stale:
+                    # Run once to initalize stale connection list, so when the first check runs stale connections can already classified as such
+                    time.sleep(5)
+                    checker.check()
             else:
                 print("Dryrun active => suspend command is not executed")
             no_activity_duration = 0
