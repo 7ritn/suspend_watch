@@ -9,6 +9,7 @@ import errno
 import stat
 from sys import stderr
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import yaml
 import psutil
@@ -24,6 +25,7 @@ class Globals:
     timeout: int
     frequency: int
     suspend_command: str
+    wakeup_time: str
     conntrack_path: str
 
 @dataclass
@@ -44,6 +46,18 @@ def unlock_locks(locks):
             os.close(lock)
     except OSError:
         pass
+
+def time_until_next_occurrence(target_time_str):
+    current_time = datetime.now()
+    target_time = datetime.strptime(target_time_str, "%H:%M")
+
+    target_datetime = datetime(current_time.year, current_time.month, current_time.day,
+                               target_time.hour, target_time.minute, target_time.second)
+
+    if current_time.time() > target_datetime.time():
+        target_datetime += timedelta(days=1)
+
+    return int((target_datetime - current_time).total_seconds())
 
 class Config:
     glob: Globals = None
@@ -73,7 +87,18 @@ class Config:
             pytimeparse.parse(args.timeout if args.timeout else globals_yaml.get("timeout", "10 min")),
             pytimeparse.parse(args.frequency if args.frequency else globals_yaml.get("frequency", "1 min")),
             args.suspend_command if args.suspend_command else globals_yaml.get("suspend_command", "/usr/bin/systemctl suspend"),
+            args.wakeup_time if args.wakeup_time else globals_yaml.get("wakeup_time", ""),
             args.conntrack_path if args.conntrack_path else globals_yaml.get("conntrack_path", "/usr/bin/conntrack"))
+
+        
+        if len(self.glob.wakeup_time) > 0:
+            if not (args.suspend_command or "suspend_command" in globals_yaml):
+                if checker.conf.glob.verbosity >= 1:
+                    print("Trying to use RTCWake for waking up at specified time")
+                self.glob.suspend_command = "/usr/sbin/rtcwake -m mem --seconds @s"
+            
+            if len(self.glob.wakeup_time) != 5:
+                raise ValueError("Wrong time format for wakeup time")
 
     def _parse_network(self, config_yaml):
         network_yaml: dict = config_yaml.get("checks", dict()).get("network", dict())
@@ -244,6 +269,8 @@ parser.add_argument("-f", "--frequency", help="frequency of checks in seconds (d
                     type=int)
 parser.add_argument("--suspend_command", help="executeable to be run when no activity detected (default /usr/bin/systemctl suspend)",
                     type=str)
+parser.add_argument("--wakeup_time", help="wakeup at specified time, define custom suspend command with @s as placeholder for time in seconds until wake up (default off)",
+                    type=str)
 parser.add_argument("--conntrack_path", help="path to conntrack executeable (default /usr/bin/conntrack)",
                     type=str)
 parser.add_argument("config", help="config file containing checks",
@@ -274,7 +301,11 @@ else:
             if checker.conf.glob.verbosity >= 1:
                 print("Suspending")
             if not checker.conf.glob.dryrun:
-                subprocess.run(checker.conf.glob.suspend_command.split(' '), shell=False, check=False)
+                suspend_command = checker.conf.glob.suspend_command
+                if checker.conf.glob.wakeup_time:
+                    sec = time_until_next_occurrence(checker.conf.glob.wakeup_time)
+                    suspend_command = suspend_command.replace("@s", str(sec))
+                subprocess.run(suspend_command.split(' '), shell=False, check=False)
                 unlock_locks(checker.active_locks)
                 if checker.conf.glob.ignore_stale:
                     # Run once to initalize stale connection list, so when the first check runs stale connections can already classified as such
